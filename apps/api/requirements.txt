@@ -1,0 +1,37 @@
+# Agentic BI API — pinned runtime dependencies.
+# Python 3.11+.
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
+pydantic==2.14.2
+pydantic-settings==2.16.2
+email-validator==2.3.0
+
+# Persistence (PostgreSQL in production, SQLite for local development)
+SQLAlchemy==2.1.6
+alembic==1.20.1
+psycopg2-binary==2.9.13
+pgvector==0.5.1
+
+# Analytical engine and ingestion
+duckdb==2.0.0
+polars==2.1.0
+openpyxl==3.1.5
+charset-normalizer==3.5.2
+sqlglot==30.26.0
+
+# Security
+bcrypt==5.0.0
+PyJWT==2.15.1
+
+# Agents, LLM and retrieval
+langgraph==1.2.18
+google-genai==2.34.0
+
+# Background jobs and storage
+celery[redis]==5.6.3
+redis==8.1.0
+boto3==1.43.122
+
+# Observability
+httpx==0.28.1

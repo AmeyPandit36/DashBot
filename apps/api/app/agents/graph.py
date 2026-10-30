@@ -1,0 +1,507 @@
+"""LangGraph orchestration for the AI analyst.
+
+Workflow (question graph)
+------------------------
+router -> analyst (plan + generate SQL + execute) -> [rag] -> compose -> verify
+        -> respond
+        -> retry (bounded) on SQL failure or ungrounded narrative
+router -> rag (definition questions) -> compose -> verify -> respond
+router -> clarify (unsupported) -> respond
+
+Bounded retries (max 2) prevent runaway loops. Every node appends to a trace so
+the UI can show what the agents did.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Callable
+
+from langgraph.graph import END, START, StateGraph
+
+from app.agents import llm
+from app.agents.state import AgentState
+from app.agents.tools import ToolContext, execute_readonly_sql, retrieve_business_context
+from app.agents.verifier import verify as run_verification
+from app.core.errors import AppError
+from app.services import narrative as nar
+from app.semantic.inference import humanize
+from app.sql import generator
+
+logger = logging.getLogger("agentic_bi.agents")
+MAX_RETRIES = 2
+
+
+def _trace(state: AgentState, node: str, **detail) -> list[dict]:
+    trace = list(state.get("trace") or [])
+    trace.append({"node": node, "at_ms": round(time.time() * 1000), **detail})
+    return trace
+
+
+def _step_payload(label: str, sql: str, params: list, columns: list[str], role: str) -> dict:
+    return {
+        "label": label,
+        "sql": sql,
+        "params": params,
+        "columns": columns,
+        "role": role,
+        "status": "pending",
+        "row_count": 0,
+        "result": None,
+        "error": None,
+    }
+
+
+def build_question_graph(ctx: ToolContext):
+    """Compile the graph for one tenant-scoped request."""
+
+    def router(state: AgentState) -> dict:
+        question = state["user_question"]
+        intent = generator.classify_intent(question, ctx.semantic)
+        if intent == "unsupported":
+            route = "clarify"
+        elif intent in ("definition", "business_context"):
+            route = "rag"
+        elif intent == "dataset_metadata":
+            route = "metadata"
+        else:
+            route = "hybrid" if intent == "decomposition" else "sql"
+        return {
+            "intent": intent,
+            "route": route,
+            "need_context": route == "hybrid",
+            "trace": _trace(state, "router", intent=intent, route=route),
+        }
+
+    def metadata(state: AgentState) -> dict:
+        profile = ctx.profile
+        composed = nar.compose_metadata(profile, ctx.semantic, ctx.dataset.name)
+        steps = [{
+            "label": "Dataset profile",
+            "sql": "-- profile computed at ingestion time",
+            "params": [],
+            "columns": ["rows", "columns", "quality_score"],
+            "role": "metadata",
+            "status": "success",
+            "row_count": 1,
+            "result": {
+                "columns": ["rows", "columns", "quality_score"],
+                "rows": [[profile.get("row_count"), profile.get("column_count"), profile.get("quality_score")]],
+            },
+        }]
+        return {
+            "plan": {"type": "metadata", "intent": "dataset_metadata"},
+            "steps": steps,
+            "sql_validated": True,
+            "narrative": composed["answer"],
+            "summary": composed["summary"],
+            "insights": composed["insights"],
+            "trace": _trace(state, "metadata"),
+        }
+
+    def analyst(state: AgentState) -> dict:
+        question = state["user_question"]
+        intent = state.get("intent", "analytical_query")
+        retry_count = int(state.get("retry_count") or 0)
+        errors = list(state.get("errors") or [])
+        steps: list[dict] = []
+        sql_validated = True
+        llm_used = False
+        tokens = int(state.get("tokens") or 0)
+        plan: dict = state.get("plan") or {}
+
+        # First attempt with Gemini SQL when available and no prior failure.
+        if llm.llm_available() and retry_count == 0 and intent not in ("decomposition",):
+            schema = [{"name": c["name"], "type": c["inferred_type"]} for c in ctx.profile.get("columns", [])]
+            generated, llm_result = generator.llm_generate_sql(question, ctx.semantic, schema, state.get("history"))
+            tokens += llm_result.tokens or 0
+            if generated:
+                llm_used = True
+                plan = {
+                    "type": "llm_sql",
+                    "intent": intent,
+                    "metrics": [
+                        m["name"] for m in ctx.semantic.get("metrics", [])
+                        if m["source_column"] and m["source_column"] in generated["sql"]
+                    ][:3],
+                    "metric_labels": [],
+                    "explanation": generated.get("explanation", ""),
+                    "reasoning": generated.get("explanation", "Generated by Gemini from the approved semantic model."),
+                }
+                step = _step_payload(question[:60], generated["sql"], [], [], "primary")
+                try:
+                    result = execute_readonly_sql(ctx, generated["sql"], limit=500)
+                    step.update({"status": "success", "result": result, "row_count": result["row_count"],
+                                 "columns": result["columns"]})
+                except AppError as exc:
+                    step.update({"status": "failed", "error": exc.message})
+                    sql_validated = False
+                    errors.append(exc.message)
+                steps.append(step)
+
+        # Deterministic path (also the recovery path if Gemini output failed).
+        if not steps or all(s["status"] != "success" for s in steps):
+            plan = generator.plan_question(question, ctx.semantic)
+            if plan["type"] == "decomposition":
+                bounds = generator.period_bounds(ctx.engine, ctx.semantic)
+                if bounds:
+                    plan["periods"] = bounds
+                    for spec in generator.build_decomposition(plan, ctx.semantic, bounds):
+                        step = _step_payload(spec["label"], spec["sql"], spec["params"], spec["columns"], spec["role"])
+                        if spec.get("dimension"):
+                            step["dimension"] = spec["dimension"]
+                            step["dimension_label"] = spec["dimension_label"]
+                        try:
+                            result = execute_readonly_sql(ctx, spec["sql"], params=spec["params"])
+                            step.update({"status": "success", "result": result, "row_count": result["row_count"],
+                                         "columns": result["columns"]})
+                        except AppError as exc:
+                            step.update({"status": "failed", "error": exc.message})
+                            errors.append(exc.message)
+                        steps.append(step)
+                else:
+                    plan = generator.plan_question(question, ctx.semantic)
+                    plan["type"] = "aggregate" if not plan.get("dimension") else "group"
+                    steps = []
+            if not steps:
+                try:
+                    spec = generator.build_plan_query(plan, ctx.semantic, ctx.version.table_name)
+                    step = _step_payload(spec["label"], spec["sql"], spec["params"], spec["columns"], "primary")
+                    result = execute_readonly_sql(ctx, spec["sql"], params=spec["params"], limit=500)
+                    step.update({"status": "success", "result": result, "row_count": result["row_count"],
+                                 "columns": result["columns"]})
+                    steps.append(step)
+                except AppError as exc:
+                    errors.append(exc.message)
+                    steps.append({
+                        "label": "Analytical query",
+                        "sql": "",
+                        "params": [],
+                        "columns": [],
+                        "role": "primary",
+                        "status": "failed",
+                        "row_count": 0,
+                        "result": None,
+                        "error": exc.message,
+                    })
+
+        return {
+            "plan": plan,
+            "steps": steps,
+            "sql_validated": sql_validated and any(s["status"] == "success" for s in steps),
+            "errors": errors[-5:],
+            "llm_used": llm_used,
+            "tokens": tokens,
+            "trace": _trace(state, "analyst", plan_type=plan.get("type"), steps=len(steps), llm=llm_used),
+        }
+
+    def rag(state: AgentState) -> dict:
+        question = state["user_question"]
+        chunks = retrieve_business_context(ctx, question, top_k=5)
+        if not chunks and state.get("need_context"):
+            # Broaden the query using the matched metric label for hybrid questions.
+            label = (state.get("plan") or {}).get("dimension_label") or ""
+            chunks = retrieve_business_context(ctx, f"{question} {label}".strip(), top_k=4)
+        return {
+            "retrieved_context": chunks,
+            "trace": _trace(state, "rag_retrieval", chunks=len(chunks)),
+        }
+
+    def compose(state: AgentState) -> dict:
+        plan = state.get("plan") or {}
+        steps = state.get("steps") or []
+        chunks = state.get("retrieved_context") or []
+        force_deterministic = bool(state.get("force_deterministic"))
+
+        primary = next((s for s in steps if s.get("role") == "primary"), None)
+        if state.get("intent") in ("definition", "business_context") or (
+            plan.get("type") in (None, "llm_sql") and not steps
+        ):
+            if chunks:
+                if state.get("intent") == "business_context":
+                    best = chunks[0]
+                    excerpt = best["content"].strip()
+                    composed = {
+                        "answer": (
+                            f"**{best['title']}**\n\n{excerpt[:700]}"
+                            "\n\nThis comes from the approved workspace knowledge base. Numeric questions are answered "
+                            "by executing SQL against the dataset."
+                        ),
+                        "summary": f"Context from {best['title']}",
+                        "insights": [
+                            {"title": c["title"], "detail": f"retrieved context (score {c['score']})", "severity": "info"}
+                            for c in chunks[:2]
+                        ],
+                    }
+                else:
+                    answer = _definition_answer(state["user_question"], chunks)
+                    composed = {
+                        "answer": (
+                            answer
+                            + "\n\nDefinitions are retrieved from the approved workspace glossary; numerical questions are "
+                            "answered by executing SQL against the dataset."
+                        ),
+                        "summary": chunks[0]["title"],
+                        "insights": [{"title": c["title"], "detail": f"retrieval score {c['score']}", "severity": "info"} for c in chunks[:2]],
+                    }
+            else:
+                composed = {
+                    "answer": (
+                        "I could not find an approved business definition for that term in this workspace. "
+                        "Approve the semantic model or add a glossary note, then ask again."
+                    ),
+                    "summary": "No matching definition",
+                    "insights": [],
+                }
+
+        elif plan.get("type") in ("llm_sql", "aggregate") and primary and primary.get("result"):
+            composed = nar.compose_aggregate(primary["result"], plan, ctx.semantic)
+        elif plan.get("type") == "group" and primary and primary.get("result"):
+            composed = nar.compose_group(primary["result"], plan, ctx.semantic)
+        elif plan.get("type") == "timeseries" and primary and primary.get("result"):
+            composed = nar.compose_timeseries(primary["result"], plan, ctx.semantic)
+        elif plan.get("type") == "decomposition":
+            composed = nar.compose_decomposition(steps, plan, ctx.semantic)
+        elif primary and primary.get("result"):
+            # Generic fallback: choose the composer by result shape.
+            result = primary["result"]
+            if plan.get("time_dimension") and result["row_count"] > 1:
+                composed = nar.compose_timeseries(result, plan, ctx.semantic)
+            elif result["row_count"] == 1:
+                composed = nar.compose_aggregate(result, plan, ctx.semantic)
+            else:
+                composed = nar.compose_group(result, plan, ctx.semantic)
+        else:
+            errors = state.get("errors") or []
+            composed = {
+                "answer": (
+                    "I could not complete that analysis. "
+                    + (f"The analytical engine reported: {errors[-1]}." if errors else "No result set was produced.")
+                    + " Try asking about a metric or dimension defined in the semantic model, for example "
+                    f"\"{nar.follow_ups(ctx.semantic, plan)[0]}\"."
+                ),
+                "summary": "Analysis could not be completed",
+                "insights": [],
+            }
+
+        narrative_text = composed["answer"]
+        if llm.llm_available() and not force_deterministic and steps and any(s.get("result") for s in steps):
+            rewritten, used = _llm_rewrite(state["user_question"], steps, composed, ctx.semantic)
+            if rewritten:
+                narrative_text = rewritten["answer"]
+                composed["summary"] = composed.get("summary") or rewritten.get("summary", "")
+                if rewritten.get("insights"):
+                    composed["insights"] = rewritten["insights"]
+
+        visualization = _visualization_for(plan, steps)
+        return {
+            "narrative": narrative_text,
+            "summary": composed.get("summary", ""),
+            "insights": composed.get("insights", []),
+            "follow_ups": nar.follow_ups(ctx.semantic, plan),
+            "visualization": visualization,
+            "trace": _trace(state, "compose", chars=len(narrative_text)),
+        }
+
+    def clarify(state: AgentState) -> dict:
+        return {
+            "narrative": (
+                "That request is outside the analytical capabilities of this workspace. "
+                "Agentic BI answers questions that can be verified against your uploaded dataset — "
+                "revenue, orders, customers, product and regional performance, trends and change drivers. "
+                "Forecasting, external data and write operations are not enabled."
+            ),
+            "summary": "Unsupported request",
+            "insights": [],
+            "steps": [],
+            "plan": {"type": "unsupported", "intent": "unsupported"},
+            "trace": _trace(state, "clarify"),
+        }
+
+    def verify(state: AgentState) -> dict:
+        steps = state.get("steps") or []
+        result = run_verification(
+            steps=steps,
+            narrative=state.get("narrative") or "",
+            sql_validated=bool(state.get("sql_validated")),
+            sql_errors=state.get("sql_errors") or (state.get("errors") or []),
+            min_rows_required=state.get("intent") not in ("definition", "unsupported"),
+            context_chunks=state.get("retrieved_context") or [],
+        )
+        retry = int(state.get("retry_count") or 0)
+        force = bool(state.get("force_deterministic"))
+        if result["status"] == "unverified" and state.get("llm_used") and not force and retry < MAX_RETRIES:
+            return {
+                "verification": result,
+                "force_deterministic": True,
+                "retry_count": retry + 1,
+                "trace": _trace(state, "verify", status=result["status"], action="retry_deterministic"),
+            }
+        return {
+            "verification": result,
+            "retry_count": retry,
+            "trace": _trace(state, "verify", status=result["status"]),
+        }
+
+    def respond(state: AgentState) -> dict:
+        steps = state.get("steps") or []
+        primary = next((s for s in steps if s.get("role") == "primary"), steps[0] if steps else None)
+        response = {
+            "answer": state.get("narrative") or "",
+            "summary": state.get("summary") or "",
+            "intent": state.get("intent"),
+            "route": state.get("route"),
+            "plan": {k: v for k, v in (state.get("plan") or {}).items() if k != "periods"},
+            "verification": state.get("verification") or {},
+            "result": primary.get("result") if primary else None,
+            "visualization": state.get("visualization"),
+            "insights": state.get("insights") or [],
+            "follow_ups": state.get("follow_ups") or [],
+            "evidence": [
+                {
+                    "label": s.get("label"),
+                    "sql": s.get("sql"),
+                    "columns": s.get("columns", []),
+                    "row_count": s.get("row_count", 0),
+                    "status": s.get("status"),
+                    "error": s.get("error"),
+                    "result": s.get("result"),
+                }
+                for s in steps
+            ],
+            "context": state.get("retrieved_context") or [],
+            "llm_used": bool(state.get("llm_used")),
+            "tokens": int(state.get("tokens") or 0),
+            "retries": int(state.get("retry_count") or 0),
+            "trace": state.get("trace") or [],
+            "errors": state.get("errors") or [],
+        }
+        return {"response": response, "trace": _trace(state, "respond")}
+
+    def route_after_router(state: AgentState) -> str:
+        return state.get("route", "sql")
+
+    def route_after_analyst(state: AgentState) -> str:
+        steps = state.get("steps") or []
+        success = any(s.get("status") == "success" for s in steps)
+        if state.get("need_context") and success:
+            return "rag"
+        return "compose"
+
+    def route_after_verify(state: AgentState) -> str:
+        verification = state.get("verification") or {}
+        trace = state.get("trace") or []
+        if trace and trace[-1].get("action") == "retry_deterministic":
+            return "compose"
+        return "respond"
+
+    graph = StateGraph(AgentState)
+    graph.add_node("router", router)
+    graph.add_node("analyst", analyst)
+    graph.add_node("rag", rag)
+    graph.add_node("metadata", metadata)
+    graph.add_node("compose", compose)
+    graph.add_node("verify", verify)
+    graph.add_node("clarify", clarify)
+    graph.add_node("respond", respond)
+
+    graph.add_edge(START, "router")
+    graph.add_conditional_edges(
+        "router",
+        route_after_router,
+        {"sql": "analyst", "hybrid": "analyst", "rag": "rag", "metadata": "metadata", "clarify": "clarify"},
+    )
+    graph.add_edge("metadata", "verify")
+    graph.add_edge("rag", "compose")
+    graph.add_conditional_edges("analyst", route_after_analyst, {"rag": "rag", "compose": "compose"})
+    graph.add_edge("compose", "verify")
+    graph.add_conditional_edges("verify", route_after_verify, {"compose": "compose", "respond": "respond"})
+    graph.add_edge("clarify", "verify")
+    graph.add_edge("respond", END)
+    return graph.compile()
+
+
+def _definition_answer(question: str, chunks: list[dict]) -> str:
+    """Pick the most relevant glossary lines instead of dumping whole chunks."""
+    tokens = set(llm.tokenize(question))
+    candidates: list[tuple[float, str]] = []
+    for chunk in chunks:
+        for line in chunk["content"].splitlines():
+            cleaned = line.strip().lstrip("-").strip()
+            if len(cleaned) < 25 or cleaned.startswith("#"):
+                continue
+            overlap = len(tokens & set(llm.tokenize(cleaned)))
+            if overlap:
+                candidates.append((overlap + chunk["score"], cleaned))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    if candidates:
+        # Only keep lines that match the question as strongly as the best line.
+        # Glossaries are dense: one shared token ("average") should not pull in
+        # an unrelated metric definition.
+        from app.agents.llm import tokenize as _tokenize  # local import keeps graph import-light
+
+        best_overlap = max(len(tokens & set(_tokenize(line))) for _, line in candidates)
+        threshold = max(2, best_overlap)
+        selected = []
+        for _, line in candidates:
+            if len(tokens & set(_tokenize(line))) < threshold:
+                continue
+            if line not in selected:
+                selected.append(line)
+            if len(selected) == 2:
+                break
+        selected = selected or [candidates[0][1]]
+        source = chunks[0]["title"]
+        return f"**{source}**\n\n" + "\n\n".join(f"• {line}" for line in selected)
+    best = chunks[0]
+    return f"**{best['title']}**\n\n{best['content'].strip()[:900]}"
+
+
+def _visualization_for(plan: dict, steps: list[dict]) -> dict | None:
+    primary = next((s for s in steps if s.get("role") == "primary" and s.get("result")), None)
+    if not primary:
+        return None
+    result = primary["result"]
+    columns = result.get("columns") or []
+    if len(columns) < 2 or result.get("row_count", 0) < 2:
+        return None
+    if plan.get("type") == "timeseries":
+        return {"type": "line_chart", "encoding": {"x": columns[0], "y": columns[1:]}}
+    if plan.get("type") in ("group", "llm_sql"):
+        return {"type": "bar_chart", "encoding": {"x": columns[0], "y": columns[1:]}}
+    return {"type": "data_table", "encoding": {"columns": columns}}
+
+
+def _llm_rewrite(question: str, steps: list[dict], composed: dict, semantic: dict) -> tuple[dict | None, bool]:
+    evidence = []
+    for step in steps:
+        result = step.get("result") or {}
+        evidence.append({
+            "label": step.get("label"),
+            "columns": result.get("columns", []),
+            "rows": (result.get("rows") or [])[:12],
+            "sql": step.get("sql", "")[:1200],
+        })
+    prompt = (
+        "Rewrite the following verified analytical answer for a business user in at most 110 words. "
+        "Use ONLY numbers that appear in the evidence. Do not invent figures or causes. "
+        "Keep markdown bold for key numbers. Return JSON: {\"answer\": str, \"summary\": str, "
+        "\"insights\": [{\"title\": str, \"detail\": str, \"severity\": \"info|positive|warning|critical\"}]}.\n\n"
+        f"Question: {question}\nEvidence: {json.dumps(evidence, default=str)[:6000]}\n"
+        f"Draft answer: {composed.get('answer', '')[:2000]}"
+    )
+
+    from pydantic import BaseModel
+
+    class Rewrite(BaseModel):
+        answer: str
+        summary: str = ""
+        insights: list[dict] = []
+
+    parsed, result = llm.generate_structured(
+        prompt, Rewrite, system="You are a precise BI analyst. Never fabricate numbers.", trace_name="chat.rewrite"
+    )
+    if parsed is None:
+        return None, False
+    return {"answer": parsed.answer, "summary": parsed.summary, "insights": parsed.insights}, True
