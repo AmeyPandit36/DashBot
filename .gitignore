@@ -1,0 +1,40 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+apps/api/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Node / Next
+node_modules/
+.next/
+out/
+dist/
+build/
+.turbo/
+*.tsbuildinfo
+apps/web/.next/
+apps/web/out/
+
+# Tests / tooling
+playwright-report/
+test-results/
+coverage/
+htmlcov/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.log

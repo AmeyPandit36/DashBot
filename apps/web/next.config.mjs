@@ -1,0 +1,31 @@
+/** @type {import('next').NextConfig} */
+const backend = process.env.BACKEND_URL || "http://127.0.0.1:8000";
+
+const nextConfig = {
+  reactStrictMode: true,
+  output: "standalone",
+  allowedDevOrigins: ["*.e2b.app", "*.arena.ai"],
+  poweredByHeader: false,
+  eslint: { ignoreDuringBuilds: true },
+  async rewrites() {
+    return [
+      {
+        source: "/api/v1/:path*",
+        destination: `${backend}/api/v1/:path*`,
+      },
+    ];
+  },
+  async headers() {
+    return [
+      {
+        source: "/(.*)",
+        headers: [
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+        ],
+      },
+    ];
+  },
+};
+
+export default nextConfig;
